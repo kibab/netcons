@@ -50,6 +50,8 @@
 #include <netinet/in.h>
 
 #define MAX_EVENT 4
+#define RINGBUFSIZE 16384
+
 const char helloworld[] = "HELLO FROM KIBAB\n";
 
 static struct proc *kthread;
@@ -63,12 +65,13 @@ static struct sysctl_oid *poid;
 struct socket *s;
 struct sockaddr_in addr;
 
-static char buf[16384];
+static char buf[RINGBUFSIZE];
 static uint32_t r_pos, w_pos;
 
 static int
 init_sock() {
 	int err;
+	char host[256];
 	err = socreate(PF_INET, &s, SOCK_DGRAM, IPPROTO_UDP,
 	    curthread->td_ucred, curthread);
 	if (err != 0) {
@@ -79,7 +82,11 @@ init_sock() {
 	addr.sin_len = sizeof(struct sockaddr_in);
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(6666);
-	err = inet_aton("10.100.1.1", &addr.sin_addr);
+	if (!getenv_string("netconsole.host", (char *) &host, 256)) {
+		printf("NetConsole host not set\n");
+		return EINVAL;
+	}
+	err = inet_aton(host, &addr.sin_addr);
 	if (err != 1) {
 		printf("Cannot convert address\n");
 		return EINVAL;
@@ -87,42 +94,61 @@ init_sock() {
 	return 0;
 }
 
-static void
-send_something(const char *msg) {
+static int
+send_something(const char *msg, uint32_t len) {
 	struct mbuf *m;
 	char *str;
 	int err;
 
 	if (s == NULL)
-		return;
+		return EINVAL;
 	m = m_gethdr(M_WAITOK, MT_DATA);
 	if (m == NULL) {
 		printf("Cannot allocate mbuf\n");
+		return ENOMEM;
 	}
+	KASSERT(len <= MHLEN, ("len > MHLEN: %d > %d", len, MHLEN));
 	str = mtod(m, char*);
-	strcpy(str, msg);
-	m->m_pkthdr.len = m->m_len = strlen(msg);
+	memcpy(str, msg, len);
+	m->m_pkthdr.len = m->m_len = len;
 
 	err = sosend(s, (struct sockaddr *) &addr, NULL, m, NULL, 0, curthread);
 
 	if (err != 0)
 		printf("sosend() error: %d\n", err);
+
+	return err;
 }
 
-char s_buf[4096];
-
 static void send_buf() {
+	int l, err;
+sendagain:
 	mtx_lock(&event_mtx);
-	int l = min(w_pos - r_pos, 4096);
+	if (w_pos < r_pos) {
+		/* Ringbuf filled */
+		l = min(RINGBUFSIZE - r_pos, MHLEN);
+	} else
+		l = min(w_pos - r_pos, MHLEN);
 	if (l < 0) {
 		mtx_unlock(&event_mtx);
 		return;
 	}
-	bzero(s_buf, 4096);
-	strlcpy(s_buf, (const char *)buf+r_pos, l);
-	r_pos += l;
 	mtx_unlock(&event_mtx);
-	send_something(s_buf);
+	err = send_something((const char *)buf + r_pos, l);
+	if (err != 0) {
+		if (err == ENETDOWN || err == ENETUNREACH) {
+			/* Network not ready yet, retry */
+			printf("Net is down(%d), retry...\n", err);
+			pause("netcons", hz / 10);
+			goto sendagain;
+		}
+		return;
+	}
+	r_pos += l;
+	if (r_pos == RINGBUFSIZE)
+		r_pos = 0;
+	if (r_pos != w_pos)
+		goto sendagain;
 }
 
 static void
@@ -145,13 +171,14 @@ sleep_thread(void *arg)
 			break;
 		case 1:
 			printf("sleep... is alive and well.\n");
+			printf("r_pos=%d w_pos=%d\n", r_pos, w_pos);
 			break;
 		case 2:
 			printf("Initializing UDP socket\n");
 			init_sock();
 			break;
 		case 3:
-			send_something(helloworld);
+			send_something(helloworld, strlen(helloworld) - 1);
 			break;
 		case 4:
 			send_buf();
@@ -218,11 +245,14 @@ netcons_cninit(struct consdev *cp)
 	printf("%s\n", __func__);
 }
 
+/* This function cannot sleep or lock mutexes! */
 static void
 netcons_cnputc(struct consdev *cp, int c)
 {
 	buf[w_pos++] = (char) c;
 	event = 4;
+	if (w_pos == RINGBUFSIZE)
+		w_pos = 0;
 	cv_signal(&event_cv);
 }
 
@@ -271,6 +301,7 @@ load(void *arg)
 	    CTLTYPE_INT | CTLFLAG_RW, 0, 0, sysctl_debug_sleep_test, "I",
 	    "");
 
+	init_sock();
 	bzero(buf, sizeof(buf));
 	r_pos = w_pos = 0;
 	netcons_cnprobe(&netcons_consdev);
