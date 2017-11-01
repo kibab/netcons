@@ -41,10 +41,16 @@
 #include <sys/unistd.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/mbuf.h>
 #include <sys/condvar.h>
+#include <sys/cons.h>
 #include <sys/sysctl.h>
+#include <sys/socket.h>
+#include <sys/socketvar.h>
+#include <netinet/in.h>
 
-#define MAX_EVENT 1
+#define MAX_EVENT 4
+const char helloworld[] = "HELLO FROM KIBAB\n";
 
 static struct proc *kthread;
 static int event;
@@ -53,6 +59,71 @@ static struct mtx event_mtx;
 
 static struct sysctl_ctx_list clist;
 static struct sysctl_oid *poid;
+
+struct socket *s;
+struct sockaddr_in addr;
+
+static char buf[16384];
+static uint32_t r_pos, w_pos;
+
+static int
+init_sock() {
+	int err;
+	err = socreate(PF_INET, &s, SOCK_DGRAM, IPPROTO_UDP,
+	    curthread->td_ucred, curthread);
+	if (err != 0) {
+		printf("Cannot create socket, err=%d\n", err);
+		return err;
+	}
+	memset(&addr, 0, sizeof(struct sockaddr_in));
+	addr.sin_len = sizeof(struct sockaddr_in);
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(6666);
+	err = inet_aton("10.100.1.1", &addr.sin_addr);
+	if (err != 1) {
+		printf("Cannot convert address\n");
+		return EINVAL;
+	}
+	return 0;
+}
+
+static void
+send_something(const char *msg) {
+	struct mbuf *m;
+	char *str;
+	int err;
+
+	if (s == NULL)
+		return;
+	m = m_gethdr(M_WAITOK, MT_DATA);
+	if (m == NULL) {
+		printf("Cannot allocate mbuf\n");
+	}
+	str = mtod(m, char*);
+	strcpy(str, msg);
+	m->m_pkthdr.len = m->m_len = strlen(msg);
+
+	err = sosend(s, (struct sockaddr *) &addr, NULL, m, NULL, 0, curthread);
+
+	if (err != 0)
+		printf("sosend() error: %d\n", err);
+}
+
+char s_buf[4096];
+
+static void send_buf() {
+	mtx_lock(&event_mtx);
+	int l = min(w_pos - r_pos, 4096);
+	if (l < 0) {
+		mtx_unlock(&event_mtx);
+		return;
+	}
+	bzero(s_buf, 4096);
+	strlcpy(s_buf, (const char *)buf+r_pos, l);
+	r_pos += l;
+	mtx_unlock(&event_mtx);
+	send_something(s_buf);
+}
 
 static void
 sleep_thread(void *arg)
@@ -74,6 +145,16 @@ sleep_thread(void *arg)
 			break;
 		case 1:
 			printf("sleep... is alive and well.\n");
+			break;
+		case 2:
+			printf("Initializing UDP socket\n");
+			init_sock();
+			break;
+		case 3:
+			send_something(helloworld);
+			break;
+		case 4:
+			send_buf();
 			break;
 		default:
 			panic("event %d is bogus\n", event);
@@ -102,6 +183,64 @@ sysctl_debug_sleep_test(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
+static cn_probe_t	netcons_cnprobe;
+static cn_init_t	netcons_cninit;
+static cn_term_t	netcons_cnterm;
+static cn_getc_t	netcons_cngetc;
+static cn_putc_t	netcons_cnputc;
+static cn_grab_t	netcons_cngrab;
+static cn_ungrab_t	netcons_cnungrab;
+
+static void
+netcons_cngrab(struct consdev *cp)
+{
+	printf("%s\n", __func__);
+}
+
+static void
+netcons_cnungrab(struct consdev *cp)
+{
+	printf("%s\n", __func__);
+}
+
+
+static void
+netcons_cnprobe(struct consdev *cp)
+{
+	sprintf(cp->cn_name, "netconsole");
+	cp->cn_pri = CN_REMOTE;
+	cp->cn_flags = CN_FLAG_NODEBUG;
+}
+
+static void
+netcons_cninit(struct consdev *cp)
+{
+	printf("%s\n", __func__);
+}
+
+static void
+netcons_cnputc(struct consdev *cp, int c)
+{
+	buf[w_pos++] = (char) c;
+	event = 4;
+	cv_signal(&event_cv);
+}
+
+static int
+netcons_cngetc(struct consdev * cp)
+{
+	printf("%s\n", __func__);
+	return 0;
+}
+
+static void
+netcons_cnterm(struct consdev * cp)
+{
+	printf("%s\n", __func__);
+}
+
+CONSOLE_DRIVER(netcons);
+
 static int
 load(void *arg)
 {
@@ -113,6 +252,7 @@ load(void *arg)
 	if (error)
 		return (error);
 
+	s = NULL;
 	event = 0;
 	mtx_init(&event_mtx, "sleep event", NULL, MTX_DEF);
 	cv_init(&event_cv, "sleep");
@@ -131,6 +271,12 @@ load(void *arg)
 	    CTLTYPE_INT | CTLFLAG_RW, 0, 0, sysctl_debug_sleep_test, "I",
 	    "");
 
+	bzero(buf, sizeof(buf));
+	r_pos = w_pos = 0;
+	netcons_cnprobe(&netcons_consdev);
+	error = cnadd(&netcons_consdev);
+	if (error)
+		printf("Failed to add console: %d\n", error);
 	return (0);
 }
 
@@ -146,8 +292,15 @@ unload(void *arg)
 	mtx_destroy(&event_mtx);
 	cv_destroy(&event_cv);
 
+	if (s) {
+		soshutdown(s, SHUT_RDWR);
+		soclose(s);
+		s = NULL;
+	}
+	cnremove(&netcons_consdev);
 	return (0);
 }
+
 
 static int
 netcons_modevent(module_t mod __unused, int event, void *arg)
